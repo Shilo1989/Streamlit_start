@@ -4,9 +4,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-# ========= אפשרות מודלים (לא חובה) =========
-# ננסה לטעון transformers לסנטימנט "אמיתי" אם מותקן.
-# אם לא מותקן - נשתמש בגישה קלה מובנית (ללא תלות).
+# ========= Optional models (not required) =========
 TRANSFORMERS_AVAILABLE = False
 try:
     from transformers import pipeline
@@ -14,13 +12,12 @@ try:
 except Exception:
     TRANSFORMERS_AVAILABLE = False
 
-st.set_page_config(page_title="דמו Streamlit + AI", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="🤖 דמו Streamlit — נתונים + AI", page_icon="🤖", layout="wide")
 
 # =======================
 # Utilities
 # =======================
 def load_csv_bytes(file_obj) -> pd.DataFrame:
-    """קריאת CSV בבטחה מתוך UploadedFile (תמיכה בקידודים נפוצים)."""
     if file_obj is None:
         return None
     data = file_obj.read()
@@ -32,12 +29,10 @@ def load_csv_bytes(file_obj) -> pd.DataFrame:
     raise ValueError("לא ניתן לקרוא את ה-CSV. בדוק/י קידוד או מבנה הקובץ.")
 
 def ensure_numeric(series: pd.Series) -> pd.Series:
-    """המרה בטוחה למספרים; ערכים בעייתיים → NaN → 0 כדי למנוע קריסה בגרפים."""
     s = pd.to_numeric(series, errors="coerce")
     return s.fillna(0.0).astype(float)
 
 def guess_numeric_columns(df: pd.DataFrame) -> list:
-    """איתור עמודות שניתן להמיר למספר (גם אם הטיפוס מקורי הוא object)."""
     out = []
     for c in df.columns:
         try:
@@ -47,23 +42,50 @@ def guess_numeric_columns(df: pd.DataFrame) -> list:
             pass
     return out
 
+def sanitize_field_name(name: str, default: str = "Value"):
+    """
+    מנרמל שם שדה כדי שיהיה בטוח לשימוש כדשם עמודה ולטובת Altair:
+    - אם ריק → default
+    - מחליף תווים לא-אות/ספרה/קוו תחתון ל־'_'
+    - מקצר רצפים של '_' ומסיר קצוות
+    """
+    if not name:
+        return default, default
+    raw = str(name).strip()
+    if raw == "":
+        return default, default
+    safe = re.sub(r"[^\w]", "_", raw, flags=re.UNICODE)
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    if safe == "":
+        safe = default
+    # safe הוא שם העמודה בפועל; raw יוצג בכותרת הציר
+    return safe, raw
+
 def make_bar_chart(series: pd.Series, label: str = "Value"):
-    """גרף עמודות יציב עם Altair (כולל תמיכה מלאה בערכי 0)."""
+    """
+    גרף עמודות יציב באמצעות Altair:
+    - המרת ערכים למספריים כולל 0
+    - נרמול שם הסדרה כדי למנוע שגיאת shorthand של Altair
+    - שימוש ב-encode מפורש: field=, type= (לא 'field:type')
+    """
     ser = ensure_numeric(series)
-    plot_df = pd.DataFrame({"Index": ser.index.astype(str), label: ser.values})
+    safe_label, raw_label = sanitize_field_name(label or "Value", default="Value")
+    plot_df = pd.DataFrame({
+        "Index": ser.index.astype(str),
+        safe_label: ser.values
+    })
     chart = (
         alt.Chart(plot_df)
         .mark_bar()
         .encode(
-            x=alt.X("Index:N", title="Index"),
-            y=alt.Y(f"{label}:Q", title=label),
+            x=alt.X(field="Index", type="nominal", title="Index"),
+            y=alt.Y(field=safe_label, type="quantitative", title=raw_label),
         )
         .properties(height=320)
     )
     return chart
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """ניקוי קל: הסרת רווחים בשמות עמודות ובטקסט."""
     if df is None:
         return None
     df2 = df.copy()
@@ -73,7 +95,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df2[c] = df2[c].apply(lambda x: str(x).strip() if pd.notna(x) else x)
     return df2
 
-# ---------- AI helpers (ללא תלות חיצונית) ----------
+# ---------- AI helpers (no external services) ----------
 _HE_STOPWORDS = {
     "אני","אתה","את","הוא","היא","אנחנו","אתם","אתן","הם","הן","של","עם","על","אל","עד","אם",
     "יש","אין","מאוד","גם","אבל","או","כי","לא","כן","זה","זו","בין","וכן","כך","כדי","היו","היה",
@@ -84,7 +106,6 @@ _EN_STOPWORDS = {
 }
 
 def _tokenize_sentences(text: str):
-    # פיצול למשפטים (פשוט ואוניברסלי יחסית)
     split = re.split(r'(?<=[\.\!\?\…])\s+|\n+', text.strip())
     return [s.strip() for s in split if s.strip()]
 
@@ -95,28 +116,19 @@ def _is_hebrew(text: str) -> bool:
     return bool(re.search(r"[א-ת]", text))
 
 def summarize_text_light(text: str, max_sentences: int = 5):
-    """
-    מסכם טקסט בשיטה קלה: חישוב שכיחות מילים (ללא מילות-עזר),
-    דירוג משפטים לפי סך הציונים, ובחירת המובילים.
-    עובד בעברית/אנגלית בלי מודלים כבדים.
-    """
     if not text or not text.strip():
         return ""
     sentences = _tokenize_sentences(text)
     if len(sentences) <= max_sentences:
         return text.strip()
-
     heb = _is_hebrew(text)
     stop = _HE_STOPWORDS if heb else _EN_STOPWORDS
-
     words = _word_tokens(text)
     freq = {}
     for w in words:
         if w in stop:
             continue
         freq[w] = freq.get(w, 0) + 1
-
-    # ניקוד משפטים לפי סכום תדירויות המילים
     scores = []
     for s in sentences:
         score = 0
@@ -125,24 +137,16 @@ def summarize_text_light(text: str, max_sentences: int = 5):
                 continue
             score += freq.get(w, 0)
         scores.append(score)
-
-    # בחירה של המשפטים עם הציון הגבוה ושמירה על הסדר המקורי
     ranked_idx = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:max_sentences]
     ranked_idx = sorted(ranked_idx)
     summary = " ".join(sentences[i] for i in ranked_idx)
     return summary.strip()
 
 def sentiment_simple(text: str):
-    """
-    סנטימנט קליל בלי מודלים: ספירת מילים חיוביות/שליליות בסיסיות (עברית/אנגלית).
-    לא “מדעי”, אבל נותן כיוון כשאין transformers.
-    """
     pos_he = {"מעולה","טוב","מצוין","יפה","מדהים","שמחה","חיובי","חזק","איכותי","קל","מהיר"}
     neg_he = {"רע","גרוע","בעייתי","עצוב","שלילי","קשה","איטי","זוועה","מבאס","נורא","כישלון"}
-
     pos_en = {"good","great","excellent","nice","amazing","happy","positive","strong","quality","easy","fast"}
     neg_en = {"bad","terrible","problem","sad","negative","hard","slow","awful","worse","failure","annoying"}
-
     tokens = _word_tokens(text)
     if _is_hebrew(text):
         p = sum(t in pos_he for t in tokens)
@@ -150,18 +154,15 @@ def sentiment_simple(text: str):
     else:
         p = sum(t in pos_en for t in tokens)
         n = sum(t in neg_en for t in tokens)
-
     score = p - n
     label = "חיובי" if score > 0 else ("שלילי" if score < 0 else "ניטרלי")
     conf = min(1.0, max(0.0, 0.5 + abs(score) / 10))
     return {"label": label, "score": conf, "p": p, "n": n}
 
-# ---------- transformers sentiment (אם זמין) ----------
 @st.cache_resource(show_spinner=False)
 def get_sentiment_pipeline():
     if not TRANSFORMERS_AVAILABLE:
         return None
-    # מודל כללי לאנגלית (קטן יחסית). אפשר להחליף ל-multilingual אם התקנתם.
     try:
         return pipeline("sentiment-analysis")
     except Exception:
@@ -208,7 +209,6 @@ with tab_tasks:
         else:
             st.warning("רשום/י טקסט למשימה.")
     st.divider()
-
     to_remove = []
     for i, todo in enumerate(st.session_state.todos):
         c1, c2, c3 = st.columns([0.08, 0.77, 0.15])
@@ -228,41 +228,26 @@ with tab_tasks:
 with tab_data:
     st.markdown("### 📄 טעינת נתונים (כאן מעלים קובץ)")
     st.caption("בחר/י קובץ CSV להעלאה, או השתמש/י בנתוני הדוגמה (מתג ב־Sidebar).")
-
     df = None
-
-    # נתוני דוגמה (אופציונלי)
     if use_sample:
-        df = pd.DataFrame(
-            {"Category": ["A", "B", "C", "D"], "Value": [10, 0, 7, 15], "Note": ["אלפא", "בטא", "גאמא", "דלתא"]}
-        )
-
-    # כפתור העלאה – בגוף העמוד
+        df = pd.DataFrame({"Category": ["A","B","C","D"], "Value": [10,0,7,15], "Note": ["אלפא","בטא","גאמא","דלתא"]})
     uploaded = st.file_uploader("בחר/י קובץ CSV להעלאה", type=["csv"], accept_multiple_files=False)
-
     if (df is None) and (uploaded is not None):
         try:
             df = load_csv_bytes(uploaded)
         except Exception as e:
             st.error(f"שגיאה בקריאת הקובץ: {e}")
-
     if df is not None:
         df = clean_dataframe(df)
         st.session_state.df = df.copy()
         st.success(f"נטענו {df.shape[0]} שורות ו-{df.shape[1]} עמודות.")
         st.write("**תצוגה:**")
         st.dataframe(df, use_container_width=True)
-
         st.markdown("#### 🧮 סטטיסטיקות מהירות")
         st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
-
         st.markdown("#### 💾 הורדת הנתונים (CSV)")
-        st.download_button(
-            "הורד CSV מעודכן",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="data_clean.csv",
-            mime="text/csv",
-        )
+        st.download_button("הורד CSV מעודכן", data=df.to_csv(index=False).encode("utf-8"),
+                           file_name="data_clean.csv", mime="text/csv")
     else:
         st.info("טרם נטענו נתונים. העלה/י CSV כאן למעלה או הפעל/י נתוני דוגמה מה־Sidebar.")
 
@@ -280,7 +265,9 @@ with tab_chart:
             st.warning("לא נמצאו עמודות שניתן להמיר למספריות.")
         else:
             col = st.selectbox("בחר/י עמודה מספרית", options=numeric_cols, index=0)
-            label = st.text_input("תווית ציר-Y (שם הסדרה)", value=col or "Value")
+            # תווית ציר-Y — עלולה להיות ריקה; נסנן אותה לפנים בטוחות:
+            user_label = st.text_input("תווית ציר-Y (שם הסדרה)", value=col or "Value")
+            safe_label, raw_label = sanitize_field_name(user_label or "Value", default="Value")
 
             cat_opts = ["(Index)"] + df.columns.tolist()
             cat_col = st.selectbox("בחר/י עמודת קטגוריה (לא חובה)", options=cat_opts, index=0)
@@ -288,17 +275,21 @@ with tab_chart:
             series = ensure_numeric(df[col])
 
             if cat_col == "(Index)":
-                chart = make_bar_chart(series, label=label)
+                # משתמשים בגרף הסטנדרטי שמנרמל שם הסדרה פנימית
+                chart = make_bar_chart(series, label=user_label or "Value")
             else:
                 grouped = (
-                    pd.DataFrame({"cat": df[cat_col].astype(str), "val": series})
-                    .groupby("cat", as_index=False)["val"].sum()
+                    pd.DataFrame({"cat": df[cat_col].astype(str), safe_label: series})
+                    .groupby("cat", as_index=False)[safe_label].sum()
                 )
                 chart = (
-                    alt.Chart(grouped).mark_bar().encode(
-                        x=alt.X("cat:N", title=cat_col),
-                        y=alt.Y("val:Q", title=label),
-                    ).properties(height=340)
+                    alt.Chart(grouped)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X(field="cat", type="nominal", title=cat_col),
+                        y=alt.Y(field=safe_label, type="quantitative", title=raw_label),
+                    )
+                    .properties(height=340)
                 )
             st.altair_chart(chart, use_container_width=True)
 
@@ -312,7 +303,6 @@ with tab_tools:
         st.markdown("#### טיפוסים ו-Nulls")
         info_df = pd.DataFrame({"dtype": df.dtypes.astype(str), "nulls": df.isna().sum()})
         st.dataframe(info_df, use_container_width=True)
-
         st.markdown("#### המרת עמודות למספריים (coerce→NaN→0)")
         cols_to_convert = st.multiselect(
             "בחר/י עמודות להמרה",
@@ -331,6 +321,20 @@ with tab_tools:
 # =======================
 # AI Tab
 # =======================
+def get_stopwords_sets():
+    HE = _HE_STOPWORDS
+    EN = _EN_STOPWORDS
+    return HE, EN
+
+_HE_STOPWORDS = {
+    "אני","אתה","את","הוא","היא","אנחנו","אתם","אתן","הם","הן","של","עם","על","אל","עד","אם",
+    "יש","אין","מאוד","גם","אבל","או","כי","לא","כן","זה","זו","בין","וכן","כך","כדי","היו","היה",
+}
+_EN_STOPWORDS = {
+    "i","you","he","she","it","we","they","the","a","an","of","to","in","on","and","or","but","is","are",
+    "was","were","be","been","very","so","that","this","these","those","as","at","by","for","from","with","without"
+}
+
 with tab_ai:
     st.markdown("## 🤖 כלים חכמים (ללא אינטגרציה חיצונית)")
     st.caption("סיכום טקסט וניתוח סנטימנט. אם מותקן transformers — יופעל מודל סנטימנט 'אמיתי'; אחרת, ניתוח קליל מובנה.")
@@ -350,7 +354,6 @@ with tab_ai:
     st.markdown("### 🙂 ניתוח סנטימנט")
     sent_text = st.text_area("טקסט לניתוח רגש", height=120, placeholder="כתוב/י משפט להערכת חיובי/שלילי/ניטרלי")
     use_transformers = st.toggle("השתמש/י ב-transformers אם זמין", value=TRANSFORMERS_AVAILABLE)
-
     if st.button("נתח/י"):
         if not sent_text.strip():
             st.warning("נא להזין טקסט.")
