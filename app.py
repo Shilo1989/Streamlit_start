@@ -1,18 +1,29 @@
 import io
+import re
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="דמו Streamlit (קובץ בלבד)", page_icon="📄", layout="wide")
+# ========= אפשרות מודלים (לא חובה) =========
+# ננסה לטעון transformers לסנטימנט "אמיתי" אם מותקן.
+# אם לא מותקן - נשתמש בגישה קלה מובנית (ללא תלות).
+TRANSFORMERS_AVAILABLE = False
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    TRANSFORMERS_AVAILABLE = False
+
+st.set_page_config(page_title="דמו Streamlit + AI", page_icon="🤖", layout="wide")
 
 # =======================
 # Utilities
 # =======================
-def load_csv_file(uploaded_file: io.BytesIO) -> pd.DataFrame:
-    """קריאת CSV בבטחה (UTF-8/Windows-1255), כולל ניקוי בסיסי."""
-    if uploaded_file is None:
+def load_csv_bytes(file_obj) -> pd.DataFrame:
+    """קריאת CSV בבטחה מתוך UploadedFile (תמיכה בקידודים נפוצים)."""
+    if file_obj is None:
         return None
-    data = uploaded_file.read()
+    data = file_obj.read()
     for enc in ("utf-8", "utf-8-sig", "windows-1255", "iso-8859-8"):
         try:
             return pd.read_csv(io.BytesIO(data), encoding=enc)
@@ -21,20 +32,20 @@ def load_csv_file(uploaded_file: io.BytesIO) -> pd.DataFrame:
     raise ValueError("לא ניתן לקרוא את ה-CSV. בדוק/י קידוד או מבנה הקובץ.")
 
 def ensure_numeric(series: pd.Series) -> pd.Series:
-    """המרה בטוחה למספרים; כשלי המרה -> NaN -> 0, כדי למנוע קריסה בגרפים."""
+    """המרה בטוחה למספרים; ערכים בעייתיים → NaN → 0 כדי למנוע קריסה בגרפים."""
     s = pd.to_numeric(series, errors="coerce")
     return s.fillna(0.0).astype(float)
 
 def guess_numeric_columns(df: pd.DataFrame) -> list:
-    """איתור עמודות שניתנות להמרה למספר (גם אם הטיפוס המקורי object)."""
-    numeric_cols = []
+    """איתור עמודות שניתן להמיר למספר (גם אם הטיפוס מקורי הוא object)."""
+    out = []
     for c in df.columns:
         try:
-            _ = pd.to_numeric(df[c], errors="coerce")
-            numeric_cols.append(c)
+            pd.to_numeric(df[c], errors="coerce")
+            out.append(c)
         except Exception:
             pass
-    return numeric_cols
+    return out
 
 def make_bar_chart(series: pd.Series, label: str = "Value"):
     """גרף עמודות יציב עם Altair (כולל תמיכה מלאה בערכי 0)."""
@@ -51,47 +62,134 @@ def make_bar_chart(series: pd.Series, label: str = "Value"):
     )
     return chart
 
-def clean_dataframe(df: pd.DataFrame, strip_whitespace: bool = True) -> pd.DataFrame:
-    """ניקוי קל: הסרת רווחים בשמות עמודות ובתאי טקסט."""
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """ניקוי קל: הסרת רווחים בשמות עמודות ובטקסט."""
     if df is None:
         return None
     df2 = df.copy()
     df2.columns = [str(c).strip() for c in df2.columns]
-    if strip_whitespace:
-        for c in df2.columns:
-            if pd.api.types.is_object_dtype(df2[c]):
-                df2[c] = df2[c].apply(lambda x: str(x).strip() if pd.notna(x) else x)
+    for c in df2.columns:
+        if pd.api.types.is_object_dtype(df2[c]):
+            df2[c] = df2[c].apply(lambda x: str(x).strip() if pd.notna(x) else x)
     return df2
+
+# ---------- AI helpers (ללא תלות חיצונית) ----------
+_HE_STOPWORDS = {
+    "אני","אתה","את","הוא","היא","אנחנו","אתם","אתן","הם","הן","של","עם","על","אל","עד","אם",
+    "יש","אין","מאוד","גם","אבל","או","כי","לא","כן","זה","זו","בין","וכן","כך","כדי","היו","היה",
+}
+_EN_STOPWORDS = {
+    "i","you","he","she","it","we","they","the","a","an","of","to","in","on","and","or","but","is","are",
+    "was","were","be","been","very","so","that","this","these","those","as","at","by","for","from","with","without"
+}
+
+def _tokenize_sentences(text: str):
+    # פיצול למשפטים (פשוט ואוניברסלי יחסית)
+    split = re.split(r'(?<=[\.\!\?\…])\s+|\n+', text.strip())
+    return [s.strip() for s in split if s.strip()]
+
+def _word_tokens(text: str):
+    return re.findall(r"[A-Za-zא-ת]+", text.lower())
+
+def _is_hebrew(text: str) -> bool:
+    return bool(re.search(r"[א-ת]", text))
+
+def summarize_text_light(text: str, max_sentences: int = 5):
+    """
+    מסכם טקסט בשיטה קלה: חישוב שכיחות מילים (ללא מילות-עזר),
+    דירוג משפטים לפי סך הציונים, ובחירת המובילים.
+    עובד בעברית/אנגלית בלי מודלים כבדים.
+    """
+    if not text or not text.strip():
+        return ""
+    sentences = _tokenize_sentences(text)
+    if len(sentences) <= max_sentences:
+        return text.strip()
+
+    heb = _is_hebrew(text)
+    stop = _HE_STOPWORDS if heb else _EN_STOPWORDS
+
+    words = _word_tokens(text)
+    freq = {}
+    for w in words:
+        if w in stop:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+
+    # ניקוד משפטים לפי סכום תדירויות המילים
+    scores = []
+    for s in sentences:
+        score = 0
+        for w in _word_tokens(s):
+            if w in stop:
+                continue
+            score += freq.get(w, 0)
+        scores.append(score)
+
+    # בחירה של המשפטים עם הציון הגבוה ושמירה על הסדר המקורי
+    ranked_idx = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:max_sentences]
+    ranked_idx = sorted(ranked_idx)
+    summary = " ".join(sentences[i] for i in ranked_idx)
+    return summary.strip()
+
+def sentiment_simple(text: str):
+    """
+    סנטימנט קליל בלי מודלים: ספירת מילים חיוביות/שליליות בסיסיות (עברית/אנגלית).
+    לא “מדעי”, אבל נותן כיוון כשאין transformers.
+    """
+    pos_he = {"מעולה","טוב","מצוין","יפה","מדהים","שמחה","חיובי","חזק","איכותי","קל","מהיר"}
+    neg_he = {"רע","גרוע","בעייתי","עצוב","שלילי","קשה","איטי","זוועה","מבאס","נורא","כישלון"}
+
+    pos_en = {"good","great","excellent","nice","amazing","happy","positive","strong","quality","easy","fast"}
+    neg_en = {"bad","terrible","problem","sad","negative","hard","slow","awful","worse","failure","annoying"}
+
+    tokens = _word_tokens(text)
+    if _is_hebrew(text):
+        p = sum(t in pos_he for t in tokens)
+        n = sum(t in neg_he for t in tokens)
+    else:
+        p = sum(t in pos_en for t in tokens)
+        n = sum(t in neg_en for t in tokens)
+
+    score = p - n
+    label = "חיובי" if score > 0 else ("שלילי" if score < 0 else "ניטרלי")
+    conf = min(1.0, max(0.0, 0.5 + abs(score) / 10))
+    return {"label": label, "score": conf, "p": p, "n": n}
+
+# ---------- transformers sentiment (אם זמין) ----------
+@st.cache_resource(show_spinner=False)
+def get_sentiment_pipeline():
+    if not TRANSFORMERS_AVAILABLE:
+        return None
+    # מודל כללי לאנגלית (קטן יחסית). אפשר להחליף ל-multilingual אם התקנתם.
+    try:
+        return pipeline("sentiment-analysis")
+    except Exception:
+        return None
 
 # =======================
 # Sidebar
 # =======================
 st.sidebar.title("⚙️ הגדרות")
 user_name = st.sidebar.text_input("שם להציג", value="חבר/ה")
-st.sidebar.caption("👈 אפשר לשנות את השם כאן")
-
-# אפשרות להשתמש בנתוני דוגמה
 use_sample = st.sidebar.toggle("השתמש/י בנתוני דוגמה", value=False)
-
-# העלאת קובץ (האפשרות היחידה לטעינת נתונים מצד המשתמש)
-uploaded = st.sidebar.file_uploader("בחר/י קובץ CSV", type=["csv"])
+st.sidebar.caption("⬇️ העלאת קובץ מתבצעת בלשונית 'נתונים'.")
 
 # =======================
 # Header
 # =======================
-st.title("📄 דמו Streamlit — העלאת קובץ בלבד")
+st.title("🤖 דמו Streamlit — נתונים + AI קליל")
 st.subheader(f"שלום {user_name}! 👋")
 st.write(
-    "האפליקציה תומכת בטעינת CSV (דרך Sidebar) או שימוש בנתוני דוגמה. "
-    "כוללת ניהול משימות, תצוגת נתונים, סטטיסטיקות מהירות, הורדת CSV, "
-    "וגרף עמודות יציב גם כאשר יש ערכי 0 או טיפוסים מעורבים."
+    "האפליקציה כוללת: העלאת CSV, תצוגה וסטטיסטיקות, גרף עמודות יציב, ולשונית AI "
+    "עם סיכום טקסט וניתוח סנטימנט (עם/בלי transformers)."
 )
 
 # =======================
 # Tabs
 # =======================
-tab_tasks, tab_data, tab_chart, tab_tools = st.tabs(
-    ["✅ משימות", "📄 נתונים", "📊 גרף", "🛠️ כלים"]
+tab_tasks, tab_data, tab_chart, tab_tools, tab_ai = st.tabs(
+    ["✅ משימות", "📄 נתונים", "📊 גרף", "🛠️ כלים", "🤖 AI"]
 )
 
 # =======================
@@ -102,14 +200,13 @@ with tab_tasks:
     if "todos" not in st.session_state:
         st.session_state.todos = []
     new_todo = st.text_input("הוסף משימה חדשה", key="todo_input")
-    cols_add = st.columns([0.2, 0.8])
-    with cols_add[0]:
-        if st.button("➕ הוסף"):
-            if new_todo and new_todo.strip():
-                st.session_state.todos.append({"text": new_todo.strip(), "done": False})
-                st.success("נוסף!")
-            else:
-                st.warning("רשום/י טקסט למשימה.")
+    add_col, _ = st.columns([0.2, 0.8])
+    if add_col.button("➕ הוסף"):
+        if new_todo and new_todo.strip():
+            st.session_state.todos.append({"text": new_todo.strip(), "done": False})
+            st.success("נוסף!")
+        else:
+            st.warning("רשום/י טקסט למשימה.")
     st.divider()
 
     to_remove = []
@@ -126,25 +223,26 @@ with tab_tasks:
         st.session_state.todos.pop(idx)
 
 # =======================
-# Data Tab
+# Data Tab  (כאן נמצא כפתור ההעלאה!)
 # =======================
 with tab_data:
-    st.markdown("### 📄 טעינת נתונים")
-    st.caption("טען/י CSV באמצעות ה־Sidebar או השתמש/י בנתוני דוגמה.")
+    st.markdown("### 📄 טעינת נתונים (כאן מעלים קובץ)")
+    st.caption("בחר/י קובץ CSV להעלאה, או השתמש/י בנתוני הדוגמה (מתג ב־Sidebar).")
 
     df = None
+
+    # נתוני דוגמה (אופציונלי)
     if use_sample:
-        # דוגמה כוללת 0 להדגמת התיקון
         df = pd.DataFrame(
-            {
-                "Category": ["A", "B", "C", "D"],
-                "Value": [10, 0, 7, 15],
-                "Note": ["אלפא", "בטא", "גאמא", "דלתא"],
-            }
+            {"Category": ["A", "B", "C", "D"], "Value": [10, 0, 7, 15], "Note": ["אלפא", "בטא", "גאמא", "דלתא"]}
         )
-    elif uploaded is not None:
+
+    # כפתור העלאה – בגוף העמוד
+    uploaded = st.file_uploader("בחר/י קובץ CSV להעלאה", type=["csv"], accept_multiple_files=False)
+
+    if (df is None) and (uploaded is not None):
         try:
-            df = load_csv_file(uploaded)
+            df = load_csv_bytes(uploaded)
         except Exception as e:
             st.error(f"שגיאה בקריאת הקובץ: {e}")
 
@@ -159,10 +257,14 @@ with tab_data:
         st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
 
         st.markdown("#### 💾 הורדת הנתונים (CSV)")
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button("הורד CSV מעודכן", data=csv_bytes, file_name="data_clean.csv", mime="text/csv")
+        st.download_button(
+            "הורד CSV מעודכן",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="data_clean.csv",
+            mime="text/csv",
+        )
     else:
-        st.info("טרם נטענו נתונים. בחר/י CSV ב־Sidebar או הפעיל/י נתוני דוגמה.")
+        st.info("טרם נטענו נתונים. העלה/י CSV כאן למעלה או הפעל/י נתוני דוגמה מה־Sidebar.")
 
 # =======================
 # Chart Tab
@@ -177,42 +279,34 @@ with tab_chart:
         if not numeric_cols:
             st.warning("לא נמצאו עמודות שניתן להמיר למספריות.")
         else:
-            st.write("בחר/י עמודה מספרית לתצוגה:")
-            col = st.selectbox("עמודה מספרית", options=numeric_cols, index=0)
+            col = st.selectbox("בחר/י עמודה מספרית", options=numeric_cols, index=0)
             label = st.text_input("תווית ציר-Y (שם הסדרה)", value=col or "Value")
 
-            st.markdown("בחר/י עמודת קטגוריה (אופציונלי):")
-            cat_col_options = ["(Index)"] + df.columns.tolist()
-            cat_col = st.selectbox("קטגוריה", options=cat_col_options, index=0)
+            cat_opts = ["(Index)"] + df.columns.tolist()
+            cat_col = st.selectbox("בחר/י עמודת קטגוריה (לא חובה)", options=cat_opts, index=0)
 
-            plot_series = ensure_numeric(df[col])
+            series = ensure_numeric(df[col])
 
             if cat_col == "(Index)":
-                chart = make_bar_chart(plot_series, label=label)
+                chart = make_bar_chart(series, label=label)
             else:
                 grouped = (
-                    pd.DataFrame({"cat": df[cat_col].astype(str), "val": plot_series})
+                    pd.DataFrame({"cat": df[cat_col].astype(str), "val": series})
                     .groupby("cat", as_index=False)["val"].sum()
                 )
                 chart = (
-                    alt.Chart(grouped)
-                    .mark_bar()
-                    .encode(
+                    alt.Chart(grouped).mark_bar().encode(
                         x=alt.X("cat:N", title=cat_col),
                         y=alt.Y("val:Q", title=label),
-                    )
-                    .properties(height=340)
+                    ).properties(height=340)
                 )
-
             st.altair_chart(chart, use_container_width=True)
 
 # =======================
 # Tools Tab
 # =======================
 with tab_tools:
-    st.markdown("### 🛠️ כלים נוספים")
-    st.write("- הצגת טיפוסים ו-Nulls לכל עמודה\n- המרת עמודות נבחרות למספרים (coerce→NaN→0)")
-
+    st.markdown("### 🛠️ כלים")
     if "df" in st.session_state:
         df = st.session_state.df.copy()
         st.markdown("#### טיפוסים ו-Nulls")
@@ -229,7 +323,50 @@ with tab_tools:
             for c in cols_to_convert:
                 df[c] = ensure_numeric(df[c])
             st.session_state.df = df
-            st.success("העמודות הומרו בהצלחה. עבר/י ללשונית 'גרף' כדי להמחיש.")
+            st.success("העמודות הומרו. עבר/י ללשונית 'גרף' כדי להמחיש.")
             st.dataframe(df.head(30), use_container_width=True)
     else:
         st.info("ראשית, טען/י נתונים בלשונית 'נתונים'.")
+
+# =======================
+# AI Tab
+# =======================
+with tab_ai:
+    st.markdown("## 🤖 כלים חכמים (ללא אינטגרציה חיצונית)")
+    st.caption("סיכום טקסט וניתוח סנטימנט. אם מותקן transformers — יופעל מודל סנטימנט 'אמיתי'; אחרת, ניתוח קליל מובנה.")
+
+    st.markdown("### ✂️ סיכום טקסט")
+    text_to_sum = st.text_area("הדבק/י או כתוב/י טקסט לסיכום", height=160, placeholder="הכנס/י טקסט בעברית או באנגלית...")
+    max_sents = st.slider("מספר משפטים בסיכום", min_value=2, max_value=10, value=5, step=1)
+    if st.button("סכם/י"):
+        if text_to_sum.strip():
+            summary = summarize_text_light(text_to_sum, max_sentences=max_sents)
+            st.write("**סיכום:**")
+            st.write(summary)
+        else:
+            st.warning("נא להזין טקסט.")
+
+    st.divider()
+    st.markdown("### 🙂 ניתוח סנטימנט")
+    sent_text = st.text_area("טקסט לניתוח רגש", height=120, placeholder="כתוב/י משפט להערכת חיובי/שלילי/ניטרלי")
+    use_transformers = st.toggle("השתמש/י ב-transformers אם זמין", value=TRANSFORMERS_AVAILABLE)
+
+    if st.button("נתח/י"):
+        if not sent_text.strip():
+            st.warning("נא להזין טקסט.")
+        else:
+            if use_transformers and TRANSFORMERS_AVAILABLE:
+                nlp = get_sentiment_pipeline()
+                if nlp is None:
+                    st.info("לא נמצא מודל זמין, משתמשים בניתוח הקליל.")
+                    res = sentiment_simple(sent_text)
+                    st.write(f"**תוצאה:** {res['label']} (בטחון {res['score']:.2f})")
+                else:
+                    out = nlp(sent_text)[0]
+                    label = out.get("label", "")
+                    score = out.get("score", 0.0)
+                    st.write(f"**תוצאה (transformers):** {label} (בטחון {score:.2f})")
+            else:
+                res = sentiment_simple(sent_text)
+                st.write(f"**תוצאה:** {res['label']} (בטחון {res['score']:.2f})")
+                st.caption("טיפ: להתנסות במודל אמיתי, הוסף/י לחבילות: transformers, torch (אופציונלי).")
