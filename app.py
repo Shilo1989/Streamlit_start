@@ -3,36 +3,30 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="דמו Streamlit משודרג", page_icon="✨", layout="wide")
+st.set_page_config(page_title="דמו Streamlit (קובץ בלבד)", page_icon="📄", layout="wide")
 
 # =======================
 # Utilities
 # =======================
 def load_csv_file(uploaded_file: io.BytesIO) -> pd.DataFrame:
-    """קריאת CSV בבטחה (UTF-8/Windows-1255), כולל ריווח/ניקוי בסיסי."""
+    """קריאת CSV בבטחה (UTF-8/Windows-1255), כולל ניקוי בסיסי."""
     if uploaded_file is None:
         return None
     data = uploaded_file.read()
-    # ננסה קידודים שונים (עברית לפעמים נשמרת ב-1255)
     for enc in ("utf-8", "utf-8-sig", "windows-1255", "iso-8859-8"):
         try:
             return pd.read_csv(io.BytesIO(data), encoding=enc)
         except Exception:
             continue
-    # אם לא הצליח, נזרוק חריגה ברורה
     raise ValueError("לא ניתן לקרוא את ה-CSV. בדוק/י קידוד או מבנה הקובץ.")
 
 def ensure_numeric(series: pd.Series) -> pd.Series:
-    """
-    המרה בטוחה למספרים:
-    - מנסה להמיר גם אם יש מחרוזות/ערכים ריקים.
-    - ערכים שלא מצליחים -> NaN -> נחליף ל-0 כדי לא לשבור גרפים.
-    """
+    """המרה בטוחה למספרים; כשלי המרה -> NaN -> 0, כדי למנוע קריסה בגרפים."""
     s = pd.to_numeric(series, errors="coerce")
     return s.fillna(0.0).astype(float)
 
 def guess_numeric_columns(df: pd.DataFrame) -> list:
-    """רשימת שמות עמודות מספריות לאחר המרה רכה (כולל כאלה שהן object אבל ניתנות להמרה)."""
+    """איתור עמודות שניתנות להמרה למספר (גם אם הטיפוס המקורי object)."""
     numeric_cols = []
     for c in df.columns:
         try:
@@ -43,31 +37,25 @@ def guess_numeric_columns(df: pd.DataFrame) -> list:
     return numeric_cols
 
 def make_bar_chart(series: pd.Series, label: str = "Value"):
-    """
-    יצירת גרף עמודות יציב באמצעות Altair (מונע שגיאות Altair/vega כשיש 0/NaN/טיפוסים מעורבים).
-    """
+    """גרף עמודות יציב עם Altair (כולל תמיכה מלאה בערכי 0)."""
     ser = ensure_numeric(series)
-    plot_df = pd.DataFrame({
-        "Index": ser.index.astype(str),
-        label: ser.values
-    })
+    plot_df = pd.DataFrame({"Index": ser.index.astype(str), label: ser.values})
     chart = (
         alt.Chart(plot_df)
         .mark_bar()
         .encode(
             x=alt.X("Index:N", title="Index"),
-            y=alt.Y(f"{label}:Q", title=label)
+            y=alt.Y(f"{label}:Q", title=label),
         )
         .properties(height=320)
     )
     return chart
 
 def clean_dataframe(df: pd.DataFrame, strip_whitespace: bool = True) -> pd.DataFrame:
-    """ניקוי קל: הסרת רווחים שמיות עמודות וב-string cells (מקטין תקלות סיווג/טיפוסים)."""
+    """ניקוי קל: הסרת רווחים בשמות עמודות ובתאי טקסט."""
     if df is None:
         return None
     df2 = df.copy()
-    # ננקה כותרות עמודות
     df2.columns = [str(c).strip() for c in df2.columns]
     if strip_whitespace:
         for c in df2.columns:
@@ -82,21 +70,21 @@ st.sidebar.title("⚙️ הגדרות")
 user_name = st.sidebar.text_input("שם להציג", value="חבר/ה")
 st.sidebar.caption("👈 אפשר לשנות את השם כאן")
 
-# אפשרות לטעון CSV מדוגמה
+# אפשרות להשתמש בנתוני דוגמה
 use_sample = st.sidebar.toggle("השתמש/י בנתוני דוגמה", value=False)
-st.sidebar.divider()
 
-# העלאת קובץ
+# העלאת קובץ (האפשרות היחידה לטעינת נתונים מצד המשתמש)
 uploaded = st.sidebar.file_uploader("בחר/י קובץ CSV", type=["csv"])
 
 # =======================
 # Header
 # =======================
-st.title("✨ דמו Streamlit משודרג")
+st.title("📄 דמו Streamlit — העלאת קובץ בלבד")
 st.subheader(f"שלום {user_name}! 👋")
 st.write(
-    "האפליקציה כוללת: ניהול משימות, טעינת CSV/הדבקת CSV, סינון בסיסי, סטטיסטיקות, "
-    "יצוא קובץ, וגרף עמודות יציב גם כשיש אפסים/טיפוסים מעורבים."
+    "האפליקציה תומכת בטעינת CSV (דרך Sidebar) או שימוש בנתוני דוגמה. "
+    "כוללת ניהול משימות, תצוגת נתונים, סטטיסטיקות מהירות, הורדת CSV, "
+    "וגרף עמודות יציב גם כאשר יש ערכי 0 או טיפוסים מעורבים."
 )
 
 # =======================
@@ -142,40 +130,24 @@ with tab_tasks:
 # =======================
 with tab_data:
     st.markdown("### 📄 טעינת נתונים")
-    st.caption("ניתן להעלות קובץ, להשתמש בדוגמה, או להדביק טקסט CSV ישירות.")
-    df = None
+    st.caption("טען/י CSV באמצעות ה־Sidebar או השתמש/י בנתוני דוגמה.")
 
-    # 1) דוגמה
+    df = None
     if use_sample:
+        # דוגמה כוללת 0 להדגמת התיקון
         df = pd.DataFrame(
             {
                 "Category": ["A", "B", "C", "D"],
-                "Value": [10, 0, 7, 15],  # כולל 0 להדגמת הבאג שתוקן
+                "Value": [10, 0, 7, 15],
                 "Note": ["אלפא", "בטא", "גאמא", "דלתא"],
             }
         )
-
-    # 2) קובץ
-    if (df is None) and (uploaded is not None):
+    elif uploaded is not None:
         try:
             df = load_csv_file(uploaded)
         except Exception as e:
             st.error(f"שגיאה בקריאת הקובץ: {e}")
 
-    # 3) הדבקה ידנית
-    with st.expander("📋 הדבקת טקסט CSV (אופציונלי)"):
-        pasted = st.text_area("הדבק/י כאן תוכן CSV", height=140, placeholder="Category,Value\nA,10\nB,0\nC,7\nD,15")
-        if st.button("טען מהטקסט"):
-            if pasted.strip():
-                try:
-                    df = pd.read_csv(io.StringIO(pasted))
-                    st.success("הטקסט נטען בהצלחה.")
-                except Exception as e:
-                    st.error(f"טעינת הטקסט נכשלה: {e}")
-            else:
-                st.warning("אין טקסט להיטען.")
-
-    # ניקוי קל + שמירה ב-Session
     if df is not None:
         df = clean_dataframe(df)
         st.session_state.df = df.copy()
@@ -183,25 +155,14 @@ with tab_data:
         st.write("**תצוגה:**")
         st.dataframe(df, use_container_width=True)
 
-        st.markdown("#### 🔎 סינון בסיסי")
-        col_sel = st.selectbox("בחר/י עמודה לחיפוש טקסטואלי", options=df.columns.tolist())
-        q = st.text_input("מילת חיפוש (מחרוזת תספיק)")
-        if q:
-            try:
-                filt = df[col_sel].astype(str).str.contains(q, case=False, na=False)
-                st.dataframe(df[filt], use_container_width=True)
-            except Exception:
-                st.warning("לא ניתן לבצע חיפוש על העמודה הזו.")
-
         st.markdown("#### 🧮 סטטיסטיקות מהירות")
         st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
 
-        st.markdown("#### 💾 הורדת קובץ")
+        st.markdown("#### 💾 הורדת הנתונים (CSV)")
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         st.download_button("הורד CSV מעודכן", data=csv_bytes, file_name="data_clean.csv", mime="text/csv")
-
     else:
-        st.info("עדיין לא נטענו נתונים. השתמש/י בדוגמה, העלאה, או הדבקה.")
+        st.info("טרם נטענו נתונים. בחר/י CSV ב־Sidebar או הפעיל/י נתוני דוגמה.")
 
 # =======================
 # Chart Tab
@@ -220,7 +181,6 @@ with tab_chart:
             col = st.selectbox("עמודה מספרית", options=numeric_cols, index=0)
             label = st.text_input("תווית ציר-Y (שם הסדרה)", value=col or "Value")
 
-            # בחירת אינדקס לקטגוריות: או עמודת טקסט, או אינדקס מספרי
             st.markdown("בחר/י עמודת קטגוריה (אופציונלי):")
             cat_col_options = ["(Index)"] + df.columns.tolist()
             cat_col = st.selectbox("קטגוריה", options=cat_col_options, index=0)
@@ -230,13 +190,8 @@ with tab_chart:
             if cat_col == "(Index)":
                 chart = make_bar_chart(plot_series, label=label)
             else:
-                # נבנה טבלת (קטגוריה, ערך) מתוך שתי העמודות
-                # אם יש כפילויות בקטגוריה – נחבר ערכים (groupby sum)
                 grouped = (
-                    pd.DataFrame({
-                        "cat": df[cat_col].astype(str),
-                        "val": plot_series
-                    })
+                    pd.DataFrame({"cat": df[cat_col].astype(str), "val": plot_series})
                     .groupby("cat", as_index=False)["val"].sum()
                 )
                 chart = (
@@ -256,24 +211,19 @@ with tab_chart:
 # =======================
 with tab_tools:
     st.markdown("### 🛠️ כלים נוספים")
-    st.write(
-        "- המרת עמודות נבחרות למספריות (coerce→NaN→0), נוח כשיש אפסים/ערכים מעורבים.\n"
-        "- הצגת טיפוסים (dtypes) ו-Nulls לכל עמודה."
-    )
+    st.write("- הצגת טיפוסים ו-Nulls לכל עמודה\n- המרת עמודות נבחרות למספרים (coerce→NaN→0)")
+
     if "df" in st.session_state:
         df = st.session_state.df.copy()
         st.markdown("#### טיפוסים ו-Nulls")
-        info_df = pd.DataFrame({
-            "dtype": df.dtypes.astype(str),
-            "nulls": df.isna().sum()
-        })
+        info_df = pd.DataFrame({"dtype": df.dtypes.astype(str), "nulls": df.isna().sum()})
         st.dataframe(info_df, use_container_width=True)
 
         st.markdown("#### המרת עמודות למספריים (coerce→NaN→0)")
         cols_to_convert = st.multiselect(
             "בחר/י עמודות להמרה",
             options=df.columns.tolist(),
-            default=[c for c in df.columns if c.lower() in ("value", "amount", "price")]
+            default=[c for c in df.columns if c.lower() in ("value", "amount", "price")],
         )
         if st.button("המר/י למספריים"):
             for c in cols_to_convert:
