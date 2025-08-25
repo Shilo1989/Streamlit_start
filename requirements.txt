@@ -2,3 +2,5 @@
 streamlit>=1.36
 pandas>=2.2
 altair>=5.3
+transformers>=4.44
+torch>=2.2
