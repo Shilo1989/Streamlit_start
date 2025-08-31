@@ -1,8 +1,11 @@
 import io
 import re
+import os
 import altair as alt
 import pandas as pd
 import streamlit as st
+import sqlite3
+import tempfile
 
 # ========= Optional models (not required) =========
 TRANSFORMERS_AVAILABLE = False
@@ -18,6 +21,7 @@ st.set_page_config(page_title="🤖 דמו Streamlit — נתונים + AI", pag
 # Utilities
 # =======================
 def load_csv_bytes(file_obj) -> pd.DataFrame:
+    """קריאת CSV מתוך UploadedFile (כמה קידודים נפוצים, כולל עברית)."""
     if file_obj is None:
         return None
     data = file_obj.read()
@@ -27,6 +31,69 @@ def load_csv_bytes(file_obj) -> pd.DataFrame:
         except Exception:
             continue
     raise ValueError("לא ניתן לקרוא את ה-CSV. בדוק/י קידוד או מבנה הקובץ.")
+
+def load_excel_bytes(file_obj) -> dict:
+    """
+    קריאת Excel מתוך UploadedFile והחזרה של מילון {sheet_name: DataFrame}.
+    שימוש ב-engine ברירת מחדל של pandas (זקוק ל-openpyxl עבור xlsx).
+    """
+    if file_obj is None:
+        return None
+    data = file_obj.read()
+    xls = pd.ExcelFile(io.BytesIO(data))
+    sheets = {}
+    for sheet in xls.sheet_names:
+        try:
+            sheets[sheet] = pd.read_excel(xls, sheet_name=sheet)
+        except Exception:
+            pass
+    if not sheets:
+        raise ValueError("לא נמצאו גיליונות קריאים בקובץ האקסל.")
+    return sheets
+
+def load_sqlite_tables(uploaded_file, limit_preview:int=1000000) -> dict:
+    """
+    קריאת קובץ SQLite DB מתוך UploadedFile:
+    - נשמור זמנית לקובץ.
+    - נמנה טבלאות מתוך sqlite_master.
+    - נקרא כל טבלה ל-DataFrame (ניתן להגביל לפי limit_preview לשמירה על זיכרון).
+    מחזיר מילון {table_name: DataFrame}.
+    """
+    if uploaded_file is None:
+        return None
+    data = uploaded_file.read()
+    tables = {}
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        con = sqlite3.connect(tmp_path)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        rows = cur.fetchall()
+        table_names = [r[0] for r in rows]
+        for t in table_names:
+            try:
+                # נקריא את כל הטבלה; אם רוצים תצוגה מהירה אפשר להגביל:
+                q = f"SELECT * FROM '{t}'"
+                if limit_preview and limit_preview > 0:
+                    q += f" LIMIT {int(limit_preview)}"
+                df = pd.read_sql_query(q, con)
+                tables[t] = df
+            except Exception:
+                pass
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    if not tables:
+        raise ValueError("לא נמצאו טבלאות לקריאה ב-DB או שהקריאה נכשלה.")
+    return tables
 
 def ensure_numeric(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
@@ -43,12 +110,6 @@ def guess_numeric_columns(df: pd.DataFrame) -> list:
     return out
 
 def sanitize_field_name(name: str, default: str = "Value"):
-    """
-    מנרמל שם שדה כדי שיהיה בטוח לשימוש כדשם עמודה ולטובת Altair:
-    - אם ריק → default
-    - מחליף תווים לא-אות/ספרה/קוו תחתון ל־'_'
-    - מקצר רצפים של '_' ומסיר קצוות
-    """
     if not name:
         return default, default
     raw = str(name).strip()
@@ -58,22 +119,12 @@ def sanitize_field_name(name: str, default: str = "Value"):
     safe = re.sub(r"_+", "_", safe).strip("_")
     if safe == "":
         safe = default
-    # safe הוא שם העמודה בפועל; raw יוצג בכותרת הציר
     return safe, raw
 
 def make_bar_chart(series: pd.Series, label: str = "Value"):
-    """
-    גרף עמודות יציב באמצעות Altair:
-    - המרת ערכים למספריים כולל 0
-    - נרמול שם הסדרה כדי למנוע שגיאת shorthand של Altair
-    - שימוש ב-encode מפורש: field=, type= (לא 'field:type')
-    """
     ser = ensure_numeric(series)
     safe_label, raw_label = sanitize_field_name(label or "Value", default="Value")
-    plot_df = pd.DataFrame({
-        "Index": ser.index.astype(str),
-        safe_label: ser.values
-    })
+    plot_df = pd.DataFrame({"Index": ser.index.astype(str), safe_label: ser.values})
     chart = (
         alt.Chart(plot_df)
         .mark_bar()
@@ -182,8 +233,8 @@ st.sidebar.caption("⬇️ העלאת קובץ מתבצעת בלשונית 'נת
 st.title("🤖 דמו Streamlit — נתונים + AI קליל")
 st.subheader(f"שלום {user_name}! 👋")
 st.write(
-    "האפליקציה כוללת: העלאת CSV, תצוגה וסטטיסטיקות, גרף עמודות יציב, ולשונית AI "
-    "עם סיכום טקסט וניתוח סנטימנט (עם/בלי transformers)."
+    "האפליקציה תומכת ב: CSV, Excel (.xlsx/.xls), ו-SQLite DB (.db/.sqlite). "
+    "כוללת תצוגה, סטטיסטיקות, הורדה ל-CSV, וגרף עמודות יציב. יש גם לשונית AI לסיכום טקסט וסנטימנט."
 )
 
 # =======================
@@ -223,33 +274,71 @@ with tab_tasks:
         st.session_state.todos.pop(idx)
 
 # =======================
-# Data Tab  (כאן נמצא כפתור ההעלאה!)
+# Data Tab
 # =======================
 with tab_data:
-    st.markdown("### 📄 טעינת נתונים (כאן מעלים קובץ)")
-    st.caption("בחר/י קובץ CSV להעלאה, או השתמש/י בנתוני הדוגמה (מתג ב־Sidebar).")
+    st.markdown("### 📄 טעינת נתונים (CSV / Excel / SQLite-DB)")
+    st.caption("בחר/י קובץ להעלאה, או השתמש/י בנתוני הדוגמה (מתג ב-Sidebar).")
     df = None
+
+    # נתוני דוגמה (אופציונלי)
     if use_sample:
-        df = pd.DataFrame({"Category": ["A","B","C","D"], "Value": [10,0,7,15], "Note": ["אלפא","בטא","גאמא","דלתא"]})
-    uploaded = st.file_uploader("בחר/י קובץ CSV להעלאה", type=["csv"], accept_multiple_files=False)
+        df = pd.DataFrame(
+            {"Category": ["A","B","C","D"], "Value": [10,0,7,15], "Note": ["אלפא","בטא","גאמא","דלתא"]}
+        )
+
+    uploaded = st.file_uploader(
+        "בחר/י קובץ: CSV / XLSX / XLS / DB / SQLITE",
+        type=["csv", "xlsx", "xls", "db", "sqlite"],
+        accept_multiple_files=False
+    )
+
+    xls_sheets = None
+    db_tables = None
+    chosen_name = None
+
     if (df is None) and (uploaded is not None):
+        name_lower = (uploaded.name or "").lower()
         try:
-            df = load_csv_bytes(uploaded)
+            if name_lower.endswith(".csv"):
+                df = load_csv_bytes(uploaded)
+                chosen_name = uploaded.name
+            elif name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
+                xls_sheets = load_excel_bytes(uploaded)  # dict of {sheet: df}
+                if xls_sheets:
+                    sheet = st.selectbox("בחר/י גיליון להצגה", options=list(xls_sheets.keys()))
+                    df = xls_sheets.get(sheet)
+                    chosen_name = f"{uploaded.name} — {sheet}"
+            elif name_lower.endswith(".db") or name_lower.endswith(".sqlite"):
+                db_tables = load_sqlite_tables(uploaded, limit_preview=100000)  # אפשר לשנות limit אם גדול
+                if db_tables:
+                    table = st.selectbox("בחר/י טבלה להצגה", options=list(db_tables.keys()))
+                    df = db_tables.get(table)
+                    chosen_name = f"{uploaded.name} — {table}"
+            else:
+                st.error("סוג קובץ לא נתמך.")
         except Exception as e:
             st.error(f"שגיאה בקריאת הקובץ: {e}")
+
     if df is not None:
         df = clean_dataframe(df)
         st.session_state.df = df.copy()
-        st.success(f"נטענו {df.shape[0]} שורות ו-{df.shape[1]} עמודות.")
+        st.success(f"נטענו {df.shape[0]} שורות ו-{df.shape[1]} עמודות." + (f" ({chosen_name})" if chosen_name else ""))
         st.write("**תצוגה:**")
         st.dataframe(df, use_container_width=True)
+
         st.markdown("#### 🧮 סטטיסטיקות מהירות")
         st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
+
         st.markdown("#### 💾 הורדת הנתונים (CSV)")
-        st.download_button("הורד CSV מעודכן", data=df.to_csv(index=False).encode("utf-8"),
-                           file_name="data_clean.csv", mime="text/csv")
+        st.download_button(
+            "הורד CSV מעודכן",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="data_clean.csv",
+            mime="text/csv",
+        )
     else:
-        st.info("טרם נטענו נתונים. העלה/י CSV כאן למעלה או הפעל/י נתוני דוגמה מה־Sidebar.")
+        st.info("טרם נטענו נתונים. העלה/י קובץ או הפעל/י נתוני דוגמה.")
 
 # =======================
 # Chart Tab
@@ -265,7 +354,6 @@ with tab_chart:
             st.warning("לא נמצאו עמודות שניתן להמיר למספריות.")
         else:
             col = st.selectbox("בחר/י עמודה מספרית", options=numeric_cols, index=0)
-            # תווית ציר-Y — עלולה להיות ריקה; נסנן אותה לפנים בטוחות:
             user_label = st.text_input("תווית ציר-Y (שם הסדרה)", value=col or "Value")
             safe_label, raw_label = sanitize_field_name(user_label or "Value", default="Value")
 
@@ -275,7 +363,6 @@ with tab_chart:
             series = ensure_numeric(df[col])
 
             if cat_col == "(Index)":
-                # משתמשים בגרף הסטנדרטי שמנרמל שם הסדרה פנימית
                 chart = make_bar_chart(series, label=user_label or "Value")
             else:
                 grouped = (
@@ -303,6 +390,7 @@ with tab_tools:
         st.markdown("#### טיפוסים ו-Nulls")
         info_df = pd.DataFrame({"dtype": df.dtypes.astype(str), "nulls": df.isna().sum()})
         st.dataframe(info_df, use_container_width=True)
+
         st.markdown("#### המרת עמודות למספריים (coerce→NaN→0)")
         cols_to_convert = st.multiselect(
             "בחר/י עמודות להמרה",
@@ -321,20 +409,6 @@ with tab_tools:
 # =======================
 # AI Tab
 # =======================
-def get_stopwords_sets():
-    HE = _HE_STOPWORDS
-    EN = _EN_STOPWORDS
-    return HE, EN
-
-_HE_STOPWORDS = {
-    "אני","אתה","את","הוא","היא","אנחנו","אתם","אתן","הם","הן","של","עם","על","אל","עד","אם",
-    "יש","אין","מאוד","גם","אבל","או","כי","לא","כן","זה","זו","בין","וכן","כך","כדי","היו","היה",
-}
-_EN_STOPWORDS = {
-    "i","you","he","she","it","we","they","the","a","an","of","to","in","on","and","or","but","is","are",
-    "was","were","be","been","very","so","that","this","these","those","as","at","by","for","from","with","without"
-}
-
 with tab_ai:
     st.markdown("## 🤖 כלים חכמים (ללא אינטגרציה חיצונית)")
     st.caption("סיכום טקסט וניתוח סנטימנט. אם מותקן transformers — יופעל מודל סנטימנט 'אמיתי'; אחרת, ניתוח קליל מובנה.")
