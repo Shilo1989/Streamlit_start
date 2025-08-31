@@ -35,7 +35,7 @@ def load_csv_bytes(file_obj) -> pd.DataFrame:
 def load_excel_bytes(file_obj) -> dict:
     """
     קריאת Excel מתוך UploadedFile והחזרה של מילון {sheet_name: DataFrame}.
-    שימוש ב-engine ברירת מחדל של pandas (זקוק ל-openpyxl עבור xlsx).
+    מצריך openpyxl ל-xlsx.
     """
     if file_obj is None:
         return None
@@ -51,49 +51,51 @@ def load_excel_bytes(file_obj) -> dict:
         raise ValueError("לא נמצאו גיליונות קריאים בקובץ האקסל.")
     return sheets
 
-def load_sqlite_tables(uploaded_file, limit_preview:int=1000000) -> dict:
-    """
-    קריאת קובץ SQLite DB מתוך UploadedFile:
-    - נשמור זמנית לקובץ.
-    - נמנה טבלאות מתוך sqlite_master.
-    - נקרא כל טבלה ל-DataFrame (ניתן להגביל לפי limit_preview לשמירה על זיכרון).
-    מחזיר מילון {table_name: DataFrame}.
-    """
-    if uploaded_file is None:
-        return None
-    data = uploaded_file.read()
-    tables = {}
+# --------- SQLite helpers: לא טוענים הכל מראש ---------
+def _sqlite_bytes_to_tempfile(db_bytes: bytes) -> str:
+    """שומר בייטים של DB לקובץ זמני ומחזיר את הנתיב."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
+        tmp.write(db_bytes)
+        return tmp.name
+
+def get_sqlite_table_names(db_bytes: bytes) -> list:
+    """מחזיר רשימת טבלאות מתוך ה-DB בלי לטעון אותן."""
+    path = _sqlite_bytes_to_tempfile(db_bytes)
     try:
-        con = sqlite3.connect(tmp_path)
+        con = sqlite3.connect(path)
         cur = con.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")
         rows = cur.fetchall()
-        table_names = [r[0] for r in rows]
-        for t in table_names:
-            try:
-                # נקריא את כל הטבלה; אם רוצים תצוגה מהירה אפשר להגביל:
-                q = f"SELECT * FROM '{t}'"
-                if limit_preview and limit_preview > 0:
-                    q += f" LIMIT {int(limit_preview)}"
-                df = pd.read_sql_query(q, con)
-                tables[t] = df
-            except Exception:
-                pass
+        return [r[0] for r in rows]
     finally:
         try:
             con.close()
         except Exception:
             pass
         try:
-            os.remove(tmp_path)
+            os.remove(path)
         except Exception:
             pass
-    if not tables:
-        raise ValueError("לא נמצאו טבלאות לקריאה ב-DB או שהקריאה נכשלה.")
-    return tables
+
+def read_sqlite_table(db_bytes: bytes, table: str, limit: int = 100000) -> pd.DataFrame:
+    """קורא טבלה בודדת לפי שם, עם LIMIT בטיחותי (ברירת מחדל 100k)."""
+    path = _sqlite_bytes_to_tempfile(db_bytes)
+    try:
+        con = sqlite3.connect(path)
+        q = f"SELECT * FROM '{table}'"
+        if limit and limit > 0:
+            q += f" LIMIT {int(limit)}"
+        df = pd.read_sql_query(q, con)
+        return df
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 def ensure_numeric(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
@@ -234,7 +236,7 @@ st.title("🤖 דמו Streamlit — נתונים + AI קליל")
 st.subheader(f"שלום {user_name}! 👋")
 st.write(
     "האפליקציה תומכת ב: CSV, Excel (.xlsx/.xls), ו-SQLite DB (.db/.sqlite). "
-    "כוללת תצוגה, סטטיסטיקות, הורדה ל-CSV, וגרף עמודות יציב. יש גם לשונית AI לסיכום טקסט וסנטימנט."
+    "ב-DB: מוצגת רשימת טבלאות לבחירה, ואז נטענת רק הטבלה שנבחרה. יש גם לשונית AI."
 )
 
 # =======================
@@ -279,6 +281,7 @@ with tab_tasks:
 with tab_data:
     st.markdown("### 📄 טעינת נתונים (CSV / Excel / SQLite-DB)")
     st.caption("בחר/י קובץ להעלאה, או השתמש/י בנתוני הדוגמה (מתג ב-Sidebar).")
+
     df = None
 
     # נתוני דוגמה (אופציונלי)
@@ -293,9 +296,16 @@ with tab_data:
         accept_multiple_files=False
     )
 
-    xls_sheets = None
-    db_tables = None
+    excel_sheets = None
     chosen_name = None
+
+    # --- SQLite state ---
+    if "db_bytes" not in st.session_state:
+        st.session_state.db_bytes = None
+    if "db_tables" not in st.session_state:
+        st.session_state.db_tables = []
+    if "db_selected_table" not in st.session_state:
+        st.session_state.db_selected_table = None
 
     if (df is None) and (uploaded is not None):
         name_lower = (uploaded.name or "").lower()
@@ -303,20 +313,72 @@ with tab_data:
             if name_lower.endswith(".csv"):
                 df = load_csv_bytes(uploaded)
                 chosen_name = uploaded.name
+
             elif name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
-                xls_sheets = load_excel_bytes(uploaded)  # dict of {sheet: df}
-                if xls_sheets:
-                    sheet = st.selectbox("בחר/י גיליון להצגה", options=list(xls_sheets.keys()))
-                    df = xls_sheets.get(sheet)
+                # טוענים גיליונות ומאפשרים לבחור
+                excel_sheets = load_excel_bytes(uploaded)
+                if excel_sheets:
+                    sheet = st.selectbox("בחר/י גיליון להצגה", options=list(excel_sheets.keys()))
+                    df = excel_sheets.get(sheet)
                     chosen_name = f"{uploaded.name} — {sheet}"
+
             elif name_lower.endswith(".db") or name_lower.endswith(".sqlite"):
-                db_tables = load_sqlite_tables(uploaded, limit_preview=100000)  # אפשר לשנות limit אם גדול
-                if db_tables:
-                    table = st.selectbox("בחר/י טבלה להצגה", options=list(db_tables.keys()))
-                    df = db_tables.get(table)
-                    chosen_name = f"{uploaded.name} — {table}"
+                # שומרים את ה-DB בבייטים ל-Session State פעם אחת
+                db_raw = uploaded.read()
+                st.session_state.db_bytes = db_raw
+                # מקבלים שמות טבלאות ומציגים לבחירה
+                st.session_state.db_tables = get_sqlite_table_names(st.session_state.db_bytes)
+                if not st.session_state.db_tables:
+                    st.error("לא נמצאו טבלאות ב-DB.")
+                else:
+                    st.markdown("#### טבלאות שנמצאו ב-DB")
+                    st.write(st.session_state.db_tables)
+                    st.session_state.db_selected_table = st.selectbox(
+                        "בחר/י טבלה להצגה",
+                        options=st.session_state.db_tables,
+                        index=0
+                    )
+                    limit = st.number_input("LIMIT לתצוגה (לשמירה על זיכרון)", min_value=1000, max_value=1_000_000, step=1000, value=100000)
+                    if st.button("טען טבלה"):
+                        try:
+                            df = read_sqlite_table(st.session_state.db_bytes, st.session_state.db_selected_table, int(limit))
+                            chosen_name = f"{uploaded.name} — {st.session_state.db_selected_table}"
+                        except Exception as e:
+                            st.error(f"שגיאה בקריאת הטבלה: {e}")
+
+                    # אופציונלי: שאילתת SQL חופשית בטוחה עם LIMIT
+                    with st.expander("🧪 שאילתת SQL (אופציונלי)"):
+                        st.caption("אפשר לכתוב SELECT על ה-DB (נוסיף LIMIT אם חסר).")
+                        sql = st.text_area("שאילתא (למשל: SELECT * FROM my_table WHERE ...)", height=120)
+                        if st.button("הרץ שאילתא"):
+                            if sql.strip():
+                                q = sql.strip().rstrip(";")
+                                if "limit" not in q.lower():
+                                    q += " LIMIT 100000"
+                                try:
+                                    # קובץ זמני מהרשימה ב-Session
+                                    tmp_path = _sqlite_bytes_to_tempfile(st.session_state.db_bytes)
+                                    try:
+                                        con = sqlite3.connect(tmp_path)
+                                        df_query = pd.read_sql_query(q, con)
+                                        df = df_query
+                                        chosen_name = f"SQL query"
+                                        st.success("השאילתא רצה בהצלחה.")
+                                    finally:
+                                        try:
+                                            con.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            os.remove(tmp_path)
+                                        except Exception:
+                                            pass
+                                except Exception as e:
+                                    st.error(f"שגיאה בהרצת השאילתא: {e}")
+
             else:
                 st.error("סוג קובץ לא נתמך.")
+
         except Exception as e:
             st.error(f"שגיאה בקריאת הקובץ: {e}")
 
